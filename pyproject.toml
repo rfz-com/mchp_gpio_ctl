@@ -42,8 +42,8 @@ tests = [
 
 [tool.maturin]
 bindings = "bin"
-manifest-path = "../Cargo.toml"
-module-name = "ruff"
+manifest-path = "Cargo.toml"
+module-name = "mchmp_gpio_ctl"
 strip = true
 
 
