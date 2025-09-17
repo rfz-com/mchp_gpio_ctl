@@ -23,13 +23,22 @@ const PRODUCT_USB4604_HUB: u16 = 0x4502;
 const VENDOR_FTDI: u16 = 0x0403;
 const PRODUCT_FT234: u16 = 0x6015;
 
+fn from_arg_usbpath(s: &str) -> Result<String, String> {
+    <USBDevice as USBDeviceAPI>::from_arg(s)
+        .map_err(|_| format!("unknown value: '{s}'."))
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
-    /// Serial number of a device to use, can use partial serial number if the result is unique
-    #[arg(short, long)]
+    /// Serial number of a device to use, can use partial serial number if the result is unique, can not be used together with usbpath
+    #[arg(short, long, group = "dongle-selection")]
     serial: Option<String>,
+    /// Usb path of a device to use, not to be used with serial number selector
+    #[arg(short, long, value_parser = from_arg_usbpath, group = "dongle-selection",
+          value_name = "bus:port-chain")]
+    usbpath: Option<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -90,6 +99,121 @@ enum Commands {
     Udev,
 }
 
+#[derive(Debug, Clone)]
+struct USBDevice {
+    device_info: DeviceInfo,
+    serial: String,
+    product_string: String,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct USBDeviceError;
+
+use nusb::DeviceInfo;
+
+pub trait USBDeviceAPI {
+    /// DeviceInfo
+    fn device(&self) -> &DeviceInfo;
+    /// Bus id as string
+    fn bus_id(&self) -> &str;
+    /// Port chain as vector of u8's
+    fn port_chain(&self) -> &[u8];
+    /// usb vendor id
+    fn vendor(&self) -> u16;
+    /// usb product id
+    fn product(&self) -> u16;
+    /// product string if available (exposed)
+    fn product_string(&self) -> Option<String>;
+    /// serial number if available (exposed)
+    fn serial_number(&self) -> Option<String>;
+    /// usb bus and port_chain as bus:p0,p2,...
+    fn usb_path(&self) -> String;
+    /// Compare usbpath to device bus_id and port_chain for match
+    fn usbpath_match(&self, s: &str) -> bool;
+    /// Compare serial to device serial for match
+    fn serial_match(&self, s: &str) -> bool;
+
+    // Helper functions
+    /// from argument to usb_path if possible
+    fn from_arg(s: &str) -> std::result::Result<String, USBDeviceError>;
+
+    /// bus id representation santizing
+    fn sanitize_usbpath(s: &str) -> String;
+}
+
+impl USBDeviceAPI for USBDevice {
+    fn device(&self) -> &DeviceInfo {
+        &self.device_info
+    }
+
+    fn bus_id(&self) -> &str {
+        self.device_info.bus_id()
+    }
+
+    fn port_chain(&self) -> &[u8] {
+        self.device_info.port_chain()
+    }
+
+    fn vendor(&self) -> u16 {
+        self.device_info.vendor_id()
+    }
+
+    fn product(&self) -> u16 {
+        self.device_info.product_id()
+    }
+
+    fn product_string(&self) -> Option<String> {
+        self.device_info.product_string().map(|p| p.to_string())
+    }
+
+    fn serial_number(&self) -> Option<String> {
+        self.device_info.serial_number().map(|p| p.to_string())
+    }
+
+
+    fn usb_path(&self) -> String {
+        // Build the uuu usbpath from bus and port_chain
+        let mut u_p: String = Self::sanitize_usbpath(self.bus_id()).to_string();
+        u_p.push(':');
+        for port in self.port_chain().iter() {
+            u_p.push_str(&port.to_string());
+        }
+        u_p.clone()
+    }
+
+    fn usbpath_match(&self, s: &str) -> bool {
+        let device_usb_path = self.usb_path();
+        device_usb_path == s
+    }
+
+    fn serial_match(&self, s: &str) -> bool {
+        match self.serial_number() {
+            None => false,
+            Some(device_serial) => device_serial == s
+        }
+    }
+
+    fn from_arg(s: &str) -> std::result::Result<String, USBDeviceError> {
+        use regex::Regex;
+        // Note that we don't really know the spec for usb bus id, and
+        // we assume that hub/port chains are limited to 7 wide per tier
+        let re = Regex::new(r"\w+:[1-8]+").unwrap();
+        if re.is_match(s) {
+            Ok(s.to_string())
+        } else {
+            Err(USBDeviceError)
+        }
+    }
+
+    fn sanitize_usbpath(usbpath: &str) -> String {
+        match i64::from_str_radix(usbpath, 16) {
+            Err(_e) => usbpath.to_string(), // Failed to parse, return str as String
+            Ok(bus_id) => bus_id.to_string(), // Managed to parse, return bus in decimal
+        }
+    }
+}
+
+
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
@@ -112,92 +236,112 @@ fn main() {
                 d.port_chain().starts_with(same_hub) && d.vendor_id() == VENDOR_SMSC && d.product_id() == PRODUCT_USB4604_HUB
             });
             let product_string = hub.and_then(|h| h.product_string()).unwrap_or("");
-            (d, serial, product_string)
+            USBDevice {
+                device_info: d.clone(),
+                serial: serial.to_string(),
+                product_string: product_string.to_string()
+            }
         })
         .collect::<Vec<_>>();
     // println!("{:?}", devices);
 
+    // for usb_device in devices.iter() {
+    //    println!("Dongle - serial: {} usb-path: {}", usb_device.serial, usb_device.usb_path());
+    // }
+
     if matches!(cli.command, Commands::List) {
         println!("Connected device list:");
-        for (_di, serial, _product_string) in devices {
-            println!("{serial}");
+        for device in devices {
+            println!("{} {}", device.serial, device.usb_path());
         }
         return;
     }
     #[cfg(target_os = "linux")]
     if matches!(cli.command, Commands::Udev) {
         println!(
-            r#"SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{:04x}", ATTRS{{idProduct}}=="{:04x}", TAG+="uaccess", GROUP="plugdev", MODE="0660""#,
-            VENDOR_SMSC, PRODUCT_BRIDGE_DEV
+            r#"SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{VENDOR_SMSC:04x}", ATTRS{{idProduct}}=="{PRODUCT_BRIDGE_DEV:04x}", TAG+="uaccess", GROUP="plugdev", MODE="0660""#
         );
         println!(
-            r#"SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{:04x}", ATTRS{{idProduct}}=="{:04x}", TAG+="uaccess", GROUP="plugdev", MODE="0660""#,
-            VENDOR_FTDI, PRODUCT_FT234
+            r#"SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{VENDOR_FTDI:04x}", ATTRS{{idProduct}}=="{PRODUCT_FT234:04x}", TAG+="uaccess", GROUP="plugdev", MODE="0660""#
         );
         return;
     }
 
-    let (di, serial, product_string) = if devices.is_empty() {
+    let d = if devices.is_empty() {
         println!("No devices found");
         return;
-    } else if devices.len() == 1 {
-        match cli.serial {
-            Some(serial) => {
-                if devices[0].1.contains(&serial) {
-                    (devices[0].0, devices[0].1, devices[0].2)
+    } else if cli.serial.is_some() {
+        let serial = cli.serial.unwrap();
+        match devices.iter().find(|d| d.serial.contains(&serial)) {
+            Some(d) => {
+                let total_matches = devices
+                    .iter()
+                    .filter_map(|d| d.serial.contains(&serial).then_some(()))
+                    .count();
+                if total_matches == 1 {
+                    &d.clone()
                 } else {
-                    println!(
-                        "Devices found, but serial provided does not match any of them, device serials:"
-                    );
-                    for (_di, serial, _product_string) in devices {
-                        println!("{serial}");
-                    }
+                    println!("Devices found, but serial provided matches more than one device");
                     return;
                 }
             }
-            None => (devices[0].0, devices[0].1, devices[0].2)
-        }
-    } else {
-        match cli.serial {
-            Some(serial) => match devices.iter().find(|(_, s, _p)| s.contains(&serial)) {
-                Some((di, serial, product_string)) => {
-                    let total_matches = devices
-                        .iter()
-                        .filter_map(|(_, s, _p)| s.contains(serial).then_some(()))
-                        .count();
-                    if total_matches == 1 {
-                        (*di, *serial, *product_string)
-                    } else {
-                        println!("Devices found, but serial provided matches more than one device");
-                        return;
-                    }
-                }
-                None => {
-                    println!(
-                        "Devices found, but serial provided does not match any of them, device serials:"
-                    );
-                    for (_di, serial, _product_string) in devices {
-                        println!("{serial}");
-                    }
-                    return;
-                }
-            },
             None => {
                 println!(
-                    "Several devices connected, please provide serial to select one of them, serials:"
+                    "Devices found, but serial provided does not match any of them, device serials:"
                 );
-                for (_di, serial, _product_string) in devices {
-                    println!("{serial}");
+                for d in devices {
+                    println!("{}", d.serial);
                 }
                 return;
             }
         }
+    } else if cli.usbpath.is_some() {
+        let usbpath = cli.usbpath.unwrap();
+        match devices.iter().find(|d| d.usbpath_match(usbpath.as_str())){
+            Some(d) => {
+                &d.clone()
+            }
+            None => {
+                println!(
+                    "Devices found, but usb path provided does not match any of them:"
+                );
+                for d in devices {
+                    println!("{}", d.usb_path());
+                }
+                return;
+            }
+        }
+    } else if devices.len() == 1 {
+        match cli.serial {
+            Some(serial) => {
+                if devices[0].serial.contains(&serial) {
+                    &devices[0]
+                } else {
+                    println!(
+                        "Devices found, but serial provided does not match any of them, device serials:"
+                    );
+                    for device in devices {
+                        println!("{}", device.serial);
+                    }
+                    return;
+                }
+            }
+            None => &devices[0].clone(),
+        }
+    } else {
+        println!(
+            "Several devices connected, please provide serial or usb path to select one of them"
+        );
+        for d in devices {
+            println!("{} {}", d.serial, d.usb_path());
+        }
+        return;
     };
 
-    let device = match di.open().wait() {
+    let device = match d.device_info.open().wait() {
         Ok(d) => d,
         Err(e) => {
-            println!("Failed to open device: {}", e);
+            println!("Failed to open device: {e}");
             #[cfg(target_os = "linux")]
             if e.kind() == nusb::ErrorKind::PermissionDenied || e.os_error() == Some(13) {
                 println!(
@@ -219,7 +363,7 @@ fn main() {
     // println!("Detected PCB RevC");
     // setup_revc(&interface);
     // }
-    let is_relay_variant = product_string.contains("relay");
+    let is_relay_variant = d.product_string.contains("relay");
 
     match &cli.command {
         Commands::On => {
@@ -239,7 +383,7 @@ fn main() {
             }
         }
         Commands::Status => {
-            println!("Dongle serial: {serial}");
+            println!("Dongle serial: {}", d.serial);
             if is_pwr_on {
                 println!("Power is ON");
             } else {
