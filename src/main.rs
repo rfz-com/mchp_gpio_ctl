@@ -213,8 +213,55 @@ impl USBDeviceAPI for USBDevice {
     }
 }
 
+#[derive(thiserror::Error, Debug)]
+/// Enum defining the errors in this module
+pub enum DongleError {
+    #[error("No dongle matching usb tree {}", .0)]
+    /// No device matching usb tree
+    NoDongleMathcingUSBTree(String),
 
-fn main() {
+    #[error("No dongle mathcing serial number {}", .0)]
+    /// No device matching serial
+    NoDongleMathcingSerial(String),
+
+    #[error("No devices found")]
+    /// No devices/dongles found
+    NoDevicesFound,
+
+    #[error("Serial {} matches more than one device", .0)]
+    /// Serial matches more than one device
+    SerialNotUnique(String),
+
+    #[error("No match for serial {}", .0)]
+    /// Serial does not match device(s)
+    NoMatchForSerial(String),
+
+    #[error("No match for USB tree {}", 0)]
+    /// USB tree does not match device(s)
+    NoMatchForUSBTree(String),
+
+    #[error("Device not specified")]
+    /// Several devices detected, need to specify which
+    DeviceNotSpecified,
+
+    #[error("Device open failed")]
+    /// Device open failed
+    DeviceOpenFail,
+
+    #[error("ForceSDP not supported on PCB Rev A or B")]
+    /// Force SDP not supported on Rev A or B
+    ForceSDPNotSupported,
+
+    #[error("Attch/Detach not supported on PCB Rev A or B")]
+    /// Attch/Detach not supported on Rev A or B
+    AttachDetachNotSupported,
+
+    #[error("GPIO not supported on PCB Rev A or B")]
+    /// GPIO not supported on Rev A or B
+    GPIONotSupported,
+}
+
+fn main() -> Result<(), DongleError> {
     env_logger::init();
     let cli = Cli::parse();
 
@@ -254,7 +301,7 @@ fn main() {
         for device in devices {
             println!("{} {}", device.serial, device.usb_path());
         }
-        return;
+        return Ok(());
     }
     #[cfg(target_os = "linux")]
     if matches!(cli.command, Commands::Udev) {
@@ -264,12 +311,12 @@ fn main() {
         println!(
             r#"SUBSYSTEMS=="usb", ATTRS{{idVendor}}=="{VENDOR_FTDI:04x}", ATTRS{{idProduct}}=="{PRODUCT_FT234:04x}", TAG+="uaccess", GROUP="plugdev", MODE="0660""#
         );
-        return;
+        return Ok(());
     }
 
     let d = if devices.is_empty() {
         println!("No devices found");
-        return;
+        return Err(DongleError::NoDevicesFound);
     } else if cli.serial.is_some() {
         let serial = cli.serial.unwrap();
         match devices.iter().find(|d| d.serial.contains(&serial)) {
@@ -282,7 +329,7 @@ fn main() {
                     &d.clone()
                 } else {
                     println!("Devices found, but serial provided matches more than one device");
-                    return;
+                    return Err(DongleError::SerialNotUnique(serial));
                 }
             }
             None => {
@@ -292,7 +339,7 @@ fn main() {
                 for d in devices {
                     println!("{}", d.serial);
                 }
-                return;
+                return Err(DongleError::NoMatchForSerial(serial));
             }
         }
     } else if cli.usbpath.is_some() {
@@ -308,11 +355,12 @@ fn main() {
                 for d in devices {
                     println!("{}", d.usb_path());
                 }
-                return;
+                return Err(DongleError::NoMatchForUSBTree(usbpath));
             }
         }
     } else if devices.len() == 1 {
         match cli.serial {
+            // DEAD CODE???
             Some(serial) => {
                 if devices[0].serial.contains(&serial) {
                     &devices[0]
@@ -323,7 +371,7 @@ fn main() {
                     for device in devices {
                         println!("{}", device.serial);
                     }
-                    return;
+                    return Err(DongleError::NoMatchForSerial(serial));
                 }
             }
             None => &devices[0].clone(),
@@ -335,7 +383,7 @@ fn main() {
         for d in devices {
             println!("{} {}", d.serial, d.usb_path());
         }
-        return;
+        return Err(DongleError::DeviceNotSpecified);
     };
 
     let device = match d.device_info.open().wait() {
@@ -348,7 +396,7 @@ fn main() {
                     "You are probably missing an udev rule, run 'mchp_gpio_ctl --help' to see how to install it"
                 );
             }
-            return;
+            return Err(DongleError::DeviceOpenFail);
         }
     };
     let interface = device.claim_interface(0).wait().unwrap();
@@ -440,7 +488,7 @@ fn main() {
         Commands::ForceSdp | Commands::ReleaseSdp | Commands::Sdp => {
             if matches!(pcb_revision, PcbRevision::RevAorB) {
                 println!("{}", "ForceSDP is not supported on PCB RevA or B".red());
-                return;
+                return Err(DongleError::ForceSDPNotSupported);
             }
             slg_io_set_mode(&interface, SlgPin::SlgIo0, PinMode::Output);
             match &cli.command {
@@ -468,7 +516,7 @@ fn main() {
                     "{}",
                     "Attach / Detach is not supported on PCB RevA or B".red()
                 );
-                return;
+                return Err(DongleError::AttachDetachNotSupported);
             }
             usb_switch_configure(&interface);
             match &cli.command {
@@ -488,7 +536,7 @@ fn main() {
                     "{}",
                     "Full Attach / Detach is not supported on PCB RevA or B".red()
                 );
-                return;
+                return Err(DongleError::AttachDetachNotSupported);
             }
             usb_switch_configure(&interface);
             slg_io_set_mode(&interface, SlgPin::SlgIo1, PinMode::Output);
@@ -510,7 +558,7 @@ fn main() {
         Commands::GpioConfig { .. } | Commands::GpioSet { .. } | Commands::GpioGet { .. } => {
             if matches!(pcb_revision, PcbRevision::RevAorB) {
                 println!("{}", "GPIO is not supported on PCB RevA or B".red());
-                return;
+                return Err(DongleError::GPIONotSupported);
             }
             match &cli.command {
                 Commands::GpioConfig { pin, mode } => {
@@ -529,5 +577,7 @@ fn main() {
                 _ => {}
             }
         }
+
     }
+    Ok(())
 }
