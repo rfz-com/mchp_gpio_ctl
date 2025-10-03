@@ -99,8 +99,7 @@ pub fn gpio_header_get_mode(interface: &Interface, pin: HeaderPin) -> PinMode {
 
 pub fn gpio_header_set(interface: &Interface, pin: HeaderPin, state: PinState) {
     if gpio_header_get_mode(interface, pin) != PinMode::Output {
-        println!("{}: {pin:?}", "Cannot set pin in input mode".red());
-        return;
+        println!("{}: {pin:?}", "Setting pin output level while in input mode".red());
     }
     let is_high = matches!(state, PinState::High);
     match pin {
